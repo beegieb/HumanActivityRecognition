@@ -1,0 +1,206 @@
+---
+title: "Classifying Workout Patterns with Human Activity Recognition"
+author: "Miroslaw Horbal"
+date: '2014-06-20'
+output:
+  html_document:
+    number_sections: yes
+    theme: journal
+---
+
+---
+
+# Introduction
+Using devices such as _Jawbone Up_, _Nike FuelBand_, and _Fitbit_ it is now possible to
+inexpensively collect a large amount of data about personal activity. These types of
+devices are becoming incresingly popular among individuals who take regular mesurements
+on themselves to improve their health, or to find behavioral patters. One thing that
+people regularly do is quantify _how much_ of a particular activity they do, but 
+they rarely quantify _how well they do it_. 
+
+In this report we exporlore using classification methods in 
+combination with data from accelerometers on the belt, forearm, arm and dumbell of 6
+participents performing barbell lifts to predict if they are performing the lift 
+correctly, or if incorrectly, what type of error they are making.
+
+# Data
+```{r LoadData, echo=FALSE, cache=TRUE}
+training <- read.csv("data/pml-training.csv", row.names=1)
+training$classe <- as.factor(training$classe)
+nonNA <- apply(training, 2, function(cl) sum(is.na(cl)))
+selCols <- (nonNA == 0)
+training <- training[,selCols]
+nc <- ncol(training)-1
+ii <- sapply(7:nc, function(i) is.integer(training[,i]))
+id <- sapply(7:nc, function(i) is.double(training[,i]))
+i <- c(1, union(7+which(ii), 7+which(id)), which(names(training)=="classe"))
+training <- training[,unique(i)]
+```
+
+The data used is the [Weight Lifting Excercise Dataset] [1] (Velloso et al. 2013). The
+dataset consists of sensor data from accelerometers on the belt, forearm, arm and 
+dumbell of 6 male participents aged between 20-28 years, with little weight lifting
+experience. The participants were tasked with performing one set of 10 repetitions 
+of the Unilateral Dumbell Biceps Curl using five different techniques: according to
+the specification (Class A), throwing the elbows in front (Class B), lifting the dumbell
+only halfway (Class C), lowering the dumbell only halfway (Class D), and throwing the 
+hips to the front (Class E). 
+
+Class A corresponds to performing the excercise according to the specification, while
+the other 4 classes correspond to common mistakes. The participants were supervised
+by an experianced weight lifter to ensure the excecution complied with the manner they
+were tasked with simulating. The weight of the dumbell was 1.25kg to ensure that the
+participants could perform the excercises in a safe, controlled manner.
+
+The dataset consists of `r nrow(training)` observations across the 6 subjects. Each 
+observation is a single time slice during the 10 rep excercise. We can see the 
+distribution of time-slices per participant, per class.
+```{r TimeSliceTable, echo=FALSE, cache=TRUE}
+with(training, table(user_name, classe, dnn=c("Subject", "Lift Class")))
+```
+
+In order to use the data for learning it was preprocessed by removing all columns that
+contain at least 1 NA value and any columns including date stamps are ignored. The processed
+dataset contains `r ncol(training)-1` covariates to use for training a classifier. 
+
+# Analysis 
+In order to provide an accurate estimate of the performance of the classification 
+algorithms on unseen data we'll take a 2-step approach. First, we'll split the data 
+into atraining and test set using a 70%/30% split. Second, we'll perform feature 
+selection, model tuning, and model selection using 10-fold cross validation. 
+
+```{r TrainTestSplit, echo=FALSE, cache=TRUE}
+library(caret)
+
+set.seed(1234)
+
+inTrain <- createDataPartition(training$classe, p=0.7, list = F)
+trData <- training[inTrain,]
+tsData <- training[-inTrain,]
+```
+
+## CART Decision Tree
+We trained is a CART decision tree using the [rpart][2] library. The only tuning 
+parameter used in this algorithm is the complexity parameter which is a real number on the 
+interval (0, 1]. The complexity parameter is used to set a threshold to how many splits are 
+in the decision tree. We look at 10 complexity parameters on an exponential scale.
+
+```{r FitCART, echo=FALSE, cache=TRUE, results='hide'}
+set.seed(1234)
+trControl <- trainControl(method="cv", p=0.7)
+cartGrid <- expand.grid(cp=3^-(10:1))
+cartFit <- train(classe~., data=trData, 
+                 trControl=trControl, tuneGrid=cartGrid, 
+                 method="rpart")
+```
+
+```{r PlotCART, echo=FALSE, cache=TRUE, fig.height=3, fig.width=4, fig.align="center"}
+ggplot(cartFit)
+cartBestTune <- cartFit$bestTune
+cartBestScore <- max(cartFit$results$Accuracy)
+```
+
+This validation chart shows the trend that a low-complexity parameter leads to improved 
+prediction accuracy. The optimal complexity is selected to be `r cartBestTune` yielding
+a cross-validation accuracy of `r cartBestScore`
+
+## Random Forest 
+A random forest can be thought of as an averaging of many decision trees that are bagged
+both along the data samples and along the covariates. A random forest generates a pool of
+decision trees (a forest) from multiple bootstrapped samples of the training data, the forest
+then performs a randomized feature selection proceedure where each split in the decision 
+tree is trained on a subset of the covariates in the training data. When making predictions
+the random forest takes the average prediction from every tree. 
+
+We use the [rf][3] package for the random forest model. The tuning parameters in this
+model are _mtry_ which controls the number of covariates to select in each tree, and _ntree_
+which controls the number of trees to generate. 
+
+```{r RandomForestFit, echo=FALSE, cache=TRUE}
+set.seed(1234)
+rfGrid <- expand.grid(mtry=c(15,37,52))
+ntree <- c(10,30,50,70,90,110)
+rfFits <- lapply(ntree, function(nt) {
+                 train(classe~., data=trData, ntree=nt,
+                       trControl=trControl, tuneGrid=rfGrid, 
+                       method="rf")})
+```
+
+```{r PlotRF, echo=FALSE, cache=TRUE, fig.height=3, fig.width=4, fig.align="center"}
+library(ggplot2)
+rfResults <- lapply(1:length(ntree), function(i) cbind(rfFits[[i]]$results, ntrees=ntree[i]))
+rfResults <- data.frame(do.call("rbind", rfResults))
+plt <- ggplot(rfResults, aes(x=ntrees, y=Accuracy, color=as.factor(mtry))) +
+         geom_point() + geom_line() + ylab("Accuracy (Cross-Validation)") +
+         xlab("N Trees") + scale_color_discrete(name="mtry") + 
+         geom_errorbar(aes(ymin=Accuracy-AccuracySD, ymax=Accuracy+AccuracySD), width=1)
+bestAcc <- which.max(rfResults$Accuracy)
+bestSD <- which.min(rfResults$AccuracySD)
+bestMtry <- rfResults$mtry[bestAcc]
+print(plt)
+```
+
+This figure shows the cross validation of each RF model for the parameters _mtry_ and 
+_ntree_. Clearly setting _mtry_ to `r rfResults$mtry[bestAcc]` gives the best RF model on
+cross validation but as shown in the table below, there is still a decision to be made on the
+optimal value of _ntree_. 
+
+```{r ShowRFResultsTable, cache=TRUE, echo=FALSE, results="asis"}
+knitr::kable(rfResults[rfResults$mtry==bestMtry, c("ntrees", "Accuracy", "AccuracySD")],
+                       format="markdown", digits=6, row.names=FALSE)
+```
+
+```{r getOptimalModel, cache=TRUE, echo=FALSE}
+best <- which.max(rfResults$Accuracy - rfResults$AccuracySD)
+rfFit <- rfFits[ntree == rfResults$ntrees[best]]
+```
+
+There is a decision to be made on the optimal number of trees. On one hand, 
+`r rfResults$ntrees[bestAcc]` gives the best accuracy while `r rfResults$ntrees[bestSD]` has
+the smallest deviation between cross validation results. For the final decision we will pick
+the model that scores highest in Accuracy - AccuracySD. In this case the optimal model has
+_ntree_ set to `r rfResults$ntrees[best]`
+
+# Results
+The table below summarizes the accuracy of the chosen Decision Tree and Random Forest models
+on the full training set, cross validation, and withheld test set.
+
+```{r testResults, cache=TRUE, echo=FALSE, results="asis"}
+dtPred <- predict(cartFit, tsData)
+rfPred <- predict(rfFit[[1]], tsData)
+dtPredTr <- predict(cartFit, trData)
+rfPredTr <- predict(rfFit[[1]], trData)
+results <- data.frame(Model=c("Decision Tree", "Random Forest"),
+                      Train.Accuracy=c(mean(dtPredTr==trData$classe),
+                                      mean(rfPredTr==trData$classe)),
+                      CV.Accuracy=c(cartBestScore, max(rfFit[[1]]$results$Accuracy)),
+                      Test.Accuracy=c(mean(dtPred == tsData$classe), 
+                                     mean(rfPred == tsData$classe)))
+knitr::kable(results, row.names=FALSE, digits=6)
+```
+
+We can see that the test results are very close to the expected results from cross
+validation. In fact, the test results are an improvement over the cross validation results
+in both cases. This is a good sign that given more data, it may be possible to improve the
+prediction accuracy of both models.
+
+# Closing Remarks
+We've seen that both Random Forests and Decision Trees can both achieve an accuracy over 90%
+on the [Weight Lifting Excercise Dataset][1] with very minimal preprocessing. For future
+research it may be worth investigating the prediction accuracy of these methods as you vote
+over a time series of datapoints instead of a single time slice. This may help furthur 
+improve accuracy. Futhermore, it may also be worthwhile to build a set of distinct learning
+algorithms and make a majority vote decision. Given the structure of the data, one would only
+need to create 6 independent classifiers to guaruntee a majority vote, and it can be proved
+that voting is guarunteed to increase the lower bound on expected accuracy with respect
+to the weakest learner assuming the weakest learner has greater than 50% accuracy.  
+
+# References
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. (2013). 
+**Qualitative Activity Recognition of Weight Lifting Exercises**. 
+Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented 
+Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+[1]: http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises
+[2]: http://cran.r-project.org/web/packages/rpart
+[3]: http://cran.r-project.org/web/packages/randomForest
